@@ -1,0 +1,140 @@
+# Updated ParticipantController with photo-based system integrated
+# Parameters for optimization moved to top, format preserved as much as possible.
+
+import os
+from typing import Dict, List, Tuple
+from controller import IntersectionController
+import math
+
+DEBUG = False
+
+# =============================
+# ОПТИМИЗИРУЕМЫЕ ПАРАМЕТРЫ
+# =============================
+STRATEGY = "green_wave"          # Режим зелёной волны
+CYCLE_LEN_BASE = 30.0            # Базовый цикл
+PLATOON_SPEED_BASE = 5.0         # Скорость потока (м/с)
+PT_PRIORITY_BOOST_BASE = 1.4     # Коэфф. продления фазы для PT
+PHOTO_DETECTION_THRESHOLD = 0.5  # Порог уверенности детектора по фото
+# =============================
+
+class ParticipantController(IntersectionController):
+    """
+    Зелёная волна + Фото‑детекция:
+
+    - Все перекрёстки синхронизированы по CYCLE_LEN.
+    - Фаза выбирается по таймингу волны.
+    - Фото‑детекция влияет на приоритет и продление фаз.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Используем вынесенные параметры
+        self.CYCLE_LEN = CYCLE_LEN_BASE
+        self.PLATOON_SPEED = PLATOON_SPEED_BASE
+        self.PT_PRIORITY_BOOST = PT_PRIORITY_BOOST_BASE
+        self.PHOTO_THRESHOLD = PHOTO_DETECTION_THRESHOLD
+
+        self.green_phases: Dict[str, List[int]] = {}
+        self.offset: Dict[str, float] = {}
+        self.phase_duration: Dict[Tuple[str, int], float] = {}
+
+        self.distances = self._calculate_distances()
+
+        first_tls = self.tls_ids[0]
+        self.offset[first_tls] = 0.0
+
+        for i, tls_id in enumerate(self.tls_ids):
+            phases = self.get_phase_catalog(tls_id)
+
+            greens = [
+                p.index
+                for p in phases
+                if "y" not in p.state and any(ch in ("G", "g") for ch in p.state)
+            ]
+            greens.sort()
+            self.green_phases[tls_id] = greens
+
+            for phase_id in greens:
+                self.phase_duration[(tls_id, phase_id)] = self.CYCLE_LEN / len(greens)
+
+            if i > 0:
+                prev = self.tls_ids[i - 1]
+                distance = self.distances.get((prev, tls_id), 50)
+                travel_time = distance / self.PLATOON_SPEED
+                self.offset[tls_id] = (self.offset[prev] + travel_time) % self.CYCLE_LEN
+
+    # -------------------------------------------------------------------------
+    def _calculate_distances(self):
+        d = {}
+        tls = self.tls_ids
+        for i in range(len(tls) - 1):
+            d[(tls[i], tls[i+1])] = 120  # метрическая заглушка
+        return d
+
+    def _current_cycle_time(self, now: float) -> float:
+        return now % self.CYCLE_LEN
+
+    def _ideal_phase(self, tls_id: str, now: float) -> int:
+        greens = self.green_phases[tls_id]
+        slot = self.phase_duration[(tls_id, greens[0])]
+        t = (self._current_cycle_time(now) - self.offset[tls_id]) % self.CYCLE_LEN
+        idx = int(t // slot) % len(greens)
+        return greens[idx]
+
+    # -------------------------------------------------------------------------
+    # НОВОЕ: анализ фото‑детекции
+    # -------------------------------------------------------------------------
+    def _photo_priority(self, tls_id: str, observation, phase_id: int) -> float:
+        photo_info = observation.get("photo", {}).get(tls_id, {})
+
+        if not photo_info:
+            return 1.0
+
+        score = photo_info.get("phase_scores", {}).get(phase_id, 0.0)
+
+        if score > self.PHOTO_THRESHOLD:
+            return 1.0 + (score - self.PHOTO_THRESHOLD)
+
+        return 1.0
+
+    # -------------------------------------------------------------------------
+    def decide_next_phase(self, observation):
+        now = float(observation.get("time", 0.0))
+        decision = {}
+
+        for tls_id in self.tls_ids:
+            light = observation["lights"][tls_id]
+            if light["time_to_next_switch"] > 0.5:
+                continue
+
+            ideal = self._ideal_phase(tls_id, now)
+
+            pt_count = 0
+            traffic_info = observation.get("traffic", {}).get(tls_id, {}).get("phases", {})
+            if ideal in traffic_info:
+                pt_count = int(traffic_info[ideal].get("pt_vehicles", 0))
+
+            duration = self.phase_duration[(tls_id, ideal)]
+
+            # приоритет PT
+            if pt_count > 0:
+                duration *= self.PT_PRIORITY_BOOST
+
+            # приоритет по фото‑детекции
+            photo_boost = self._photo_priority(tls_id, observation, ideal)
+            duration *= photo_boost
+
+            if DEBUG:
+                print(
+                    f"[green_wave+photo] {tls_id} -> phase {ideal}, base={self.phase_duration[(tls_id, ideal)]:.1f}, "
+                    f"PT={pt_count}, photo_boost={photo_boost:.2f}, final={duration:.1f}"
+                )
+
+            decision[tls_id] = {
+                "phase_id": ideal,
+                "duration": duration
+            }
+
+        return decision or None
