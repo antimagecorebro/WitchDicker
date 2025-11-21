@@ -1,0 +1,54 @@
+def decide_next_phase(self, observation: Dict) -> Optional[Dict[str, Dict[str, float]]]:
+    decision: Dict[str, Dict[str, float]] = {}
+
+    for tls_id in self.tls_ids:
+        # Информация о текущем состоянии светофора
+        light_info = observation.get("lights", {}).get(tls_id, {}) or {}
+
+        time_to_switch = float(light_info.get("time_to_next_switch", 0.0))
+
+        # ⚠️ БЕЗОПАСНО ДОСТАЁМ ТЕКУЩУЮ ФАЗУ
+        raw_current_phase = light_info.get("current_phase", 0)
+        if isinstance(raw_current_phase, int):
+            current_phase_id = raw_current_phase
+        elif isinstance(raw_current_phase, dict):
+            # Попробуем вытащить индекс фазы из словаря
+            current_phase_id = int(raw_current_phase.get("phase_id", 0))
+        else:
+            # Если формат неожиданный — считаем, что фаза 0
+            current_phase_id = 0
+
+        # Если до следующего автоматического переключения ещё далеко — не трогаем
+        if time_to_switch > 0.5:
+            if DEBUG:
+                print(f"[SKIP] tls_id={tls_id}, time_to_switch={time_to_switch:.2f}")
+            continue
+
+        # дальше твой код без изменений...
+        phase_priorities = self._get_phase_priority(observation, tls_id)
+
+        if not phase_priorities:
+            if DEBUG:
+                print(f"[NO_PHASES] tls_id={tls_id}")
+            continue
+
+        total_waiting = sum(
+            self._calculate_waiting_traffic(observation, tls_id, pid)
+            for pid in self.green_phases[tls_id]
+        )
+        if total_waiting <= 0:
+            if DEBUG:
+                print(f"[NO_WAITING] tls_id={tls_id}")
+            continue
+
+        if all(score <= 0 for _, score in phase_priorities):
+            best_phase_id = max(
+                self.green_phases[tls_id],
+                key=lambda pid: self._calculate_waiting_traffic(
+                    observation, tls_id, pid
+                ),
+            )
+        else:
+            best_phase_id = max(phase_priorities, key=lambda x: x[1])[0]
+
+        # ... и т.д.
