@@ -1,0 +1,299 @@
+import os
+import math
+from typing import Dict, List, Tuple, Optional
+
+from controller import IntersectionController
+
+DEBUG = False
+STRATEGY = "demand_based_optimized_v2"
+
+
+class ParticipantController(IntersectionController):
+    """
+    Улучшенный контроллер светофора.
+
+    Основные идеи:
+    - Смотрим не только на текущую очередь, но и на её рост (Δочереди).
+    - Оцениваем "эффективность" фазы по ожидающим и оценке пропускной способности.
+    - Длительность зелёной фазы растёт сублинейно (через sqrt(очереди)), чтобы не было гигантских перекосов.
+    - Лёгкая защита от залипания фазы (слишком длинное удержание одной фазы).
+    - Плавность за счёт ограничений по min/max длительности.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Базовые ограничения по длительности зелёного
+        self.min_green_duration: float = 10.0
+        self.max_green_duration: float = 60.0
+
+        # Параметры "важности" разных компонент в скоре фазы
+        self.derivative_weight: float = 30.0  # важность роста очереди
+        self.waiting_weight: float = 5.0      # дополнительный вес самой очереди
+
+        # Набор зелёных фаз по светофорам
+        self.green_phases: Dict[str, List[int]] = {}
+        # "Курсор" по фазам (можно использовать как историю/индекс)
+        self.cursor: Dict[str, int] = {}
+        # Вес фазы (можно адаптивно менять)
+        self.phase_weights: Dict[str, Dict[int, float]] = {}
+        # История количества включений фазы
+        self.last_phase_actions: Dict[str, Dict[int, float]] = {}
+        # Таймер: сколько подряд мы держим фазу активной
+        self.phase_timer: Dict[str, Dict[int, int]] = {}
+        # Предыдущее значение очереди для вычисления Δочереди
+        self.prev_waiting: Dict[str, Dict[int, float]] = {}
+
+        # Инициализация фаз
+        for tls_id in self.tls_ids:
+            phases = self.get_phase_catalog(tls_id)
+            greens = [
+                phase.index
+                for phase in phases
+                if "y" not in phase.state and any(ch in ("G", "g") for ch in phase.state)
+            ]
+            if not greens:
+                raise RuntimeError(
+                    f"В программе светофора '{tls_id}' нет ни одной зелёной фазы."
+                )
+            greens.sort()
+            self.green_phases[tls_id] = greens
+            self.cursor[tls_id] = 0
+            self.phase_weights[tls_id] = {phase_id: 1.0 for phase_id in greens}
+            self.last_phase_actions[tls_id] = {phase_id: 0.0 for phase_id in greens}
+            self.phase_timer[tls_id] = {phase_id: 0 for phase_id in greens}
+            self.prev_waiting[tls_id] = {phase_id: 0.0 for phase_id in greens}
+
+        if DEBUG:
+            print(f"[INIT] tls_ids={self.tls_ids}")
+            print(f"[INIT] green_phases={self.green_phases}")
+
+    # ---------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---------------------- #
+
+    def _calculate_waiting_traffic(self, observation: Dict, tls_id: str, phase_id: int) -> float:
+        """
+        Возвращает количество машин, ожидающих для конкретной фазы светофора.
+        Ожидается, что в observation есть структура:
+        observation["waiting_vehicles"][tls_id][phase_id] = count
+        """
+        waiting_vehicles = observation.get("waiting_vehicles", {}).get(tls_id, {})
+        return float(waiting_vehicles.get(phase_id, 0.0))
+
+    def _estimate_phase_capacity(self, observation: Dict, tls_id: str, phase_id: int) -> float:
+        """
+        Приблизительная оценка пропускной способности фазы (авто/мин).
+        Задача — задать разумную шкалу, а не точную физическую модель.
+        """
+        waiting_count = self._calculate_waiting_traffic(observation, tls_id, phase_id)
+
+        # Базовая пропускная способность и небольшая зависимость от очереди
+        base_capacity = 80.0  # авто/мин
+        capacity = base_capacity + waiting_count * 1.2
+
+        # Минимальный порог, чтобы фаза не считалась "нулевой"
+        capacity = max(10.0, capacity)
+
+        return capacity
+
+    def _calculate_phase_efficiency(self, observation: Dict, tls_id: str, phase_id: int) -> float:
+        """
+        Эффективность фазы как грубая метрика:
+        efficiency ≈ waiting_count * capacity
+        (чем больше очереди и чем выше оценка пропускной способности, тем важнее фаза)
+        """
+        waiting_count = self._calculate_waiting_traffic(observation, tls_id, phase_id)
+        if waiting_count <= 0:
+            return 0.0
+
+        capacity = self._estimate_phase_capacity(observation, tls_id, phase_id)
+        efficiency = waiting_count * capacity
+        return efficiency
+
+    def _traffic_derivative(self, observation: Dict, tls_id: str, phase_id: int) -> float:
+        """
+        Δочереди = текущая очередь - предыдущая.
+        Положительное значение означает рост пробки.
+        """
+        current_waiting = self._calculate_waiting_traffic(observation, tls_id, phase_id)
+        prev = self.prev_waiting[tls_id].get(phase_id, 0.0)
+        self.prev_waiting[tls_id][phase_id] = current_waiting
+        return current_waiting - prev
+
+    def _get_phase_priority(self, observation: Dict, tls_id: str) -> List[Tuple[int, float]]:
+        """
+        Считает приоритет фаз для данного светофора.
+
+        Приоритет строится из:
+        - эффективности (waiting * capacity),
+        - роста очереди (derivative),
+        - самой величины очереди,
+        - фазового веса (history-based weight).
+        """
+        phases = self.green_phases[tls_id]
+        raw_scores: List[Tuple[int, float]] = []
+
+        for phase_id in phases:
+            waiting_count = self._calculate_waiting_traffic(observation, tls_id, phase_id)
+            efficiency = self._calculate_phase_efficiency(observation, tls_id, phase_id)
+            derivative = max(0.0, self._traffic_derivative(observation, tls_id, phase_id))
+
+            # Базовый скор: эффективность + рост очереди + сама очередь
+            score = (
+                efficiency
+                + derivative * self.derivative_weight
+                + waiting_count * self.waiting_weight
+            )
+
+            # Учитываем исторический вес фазы
+            score *= self.phase_weights[tls_id].get(phase_id, 1.0)
+
+            raw_scores.append((phase_id, score))
+
+        if not raw_scores:
+            return []
+
+        # Нормализуем, чтобы избежать экстремальных значений
+        max_score = max(s for _, s in raw_scores)
+        if max_score <= 0:
+            # Если все нулевые, возвращаем нули (данные обработаются выше по логике)
+            return [(pid, 0.0) for pid, _ in raw_scores]
+
+        normalized_scores = [(pid, s / (max_score + 1e-6)) for pid, s in raw_scores]
+
+        if DEBUG:
+            print(f"[PRIORITY] tls_id={tls_id}, raw={raw_scores}, norm={normalized_scores}")
+
+        return normalized_scores
+
+    # ---------------------- ОСНОВНОЙ МЕТОД РЕШЕНИЯ ---------------------- #
+
+    def decide_next_phase(self, observation: Dict) -> Optional[Dict[str, Dict[str, float]]]:
+        """
+        Основной метод принятия решения.
+        Возвращает:
+        {
+            tls_id: {
+                "phase_id": <int>,
+                "duration": <float>
+            },
+            ...
+        }
+        либо None, если менять ничего не нужно.
+        """
+        decision: Dict[str, Dict[str, float]] = {}
+
+        for tls_id in self.tls_ids:
+            # Информация о текущем состоянии светофора
+            light_info = observation.get("lights", {}).get(tls_id, {})
+            time_to_switch = float(light_info.get("time_to_next_switch", 0.0))
+            current_phase_id = int(light_info.get("current_phase", 0))
+
+            # Если до следующего автоматического переключения ещё далеко — не трогаем
+            if time_to_switch > 0.5:
+                if DEBUG:
+                    print(f"[SKIP] tls_id={tls_id}, time_to_switch={time_to_switch:.2f}")
+                continue
+
+            # Считаем приоритеты фаз
+            phase_priorities = self._get_phase_priority(observation, tls_id)
+
+            if not phase_priorities:
+                # Ничего не знаем про фазы — ничего не делаем
+                if DEBUG:
+                    print(f"[NO_PHASES] tls_id={tls_id}")
+                continue
+
+            # Проверяем, есть ли вообще ожидающие машины
+            total_waiting = sum(
+                self._calculate_waiting_traffic(observation, tls_id, pid)
+                for pid in self.green_phases[tls_id]
+            )
+            if total_waiting <= 0:
+                # Машин нет — можно ничего не менять
+                if DEBUG:
+                    print(f"[NO_WAITING] tls_id={tls_id}")
+                continue
+
+            # Если все приоритеты нулевые — выбираем фазу с максимальной очередью
+            if all(score <= 0 for _, score in phase_priorities):
+                best_phase_id = max(
+                    self.green_phases[tls_id],
+                    key=lambda pid: self._calculate_waiting_traffic(
+                        observation, tls_id, pid
+                    ),
+                )
+            else:
+                # Выбираем фазу с максимальным нормализованным приоритетом
+                best_phase_id = max(phase_priorities, key=lambda x: x[1])[0]
+
+            # Лёгкая защита от чрезмерных переключений:
+            # если уже стоим на этой фазе и очереди в других маленькие, можно не переключать
+            if best_phase_id == current_phase_id:
+                # Оценим максимальную очередь на других фазах
+                max_other_waiting = 0.0
+                for pid in self.green_phases[tls_id]:
+                    if pid == current_phase_id:
+                        continue
+                    max_other_waiting = max(
+                        max_other_waiting,
+                        self._calculate_waiting_traffic(observation, tls_id, pid),
+                    )
+
+                # Если у других очереди небольшие, можно не дергаться
+                if max_other_waiting < 3:
+                    if DEBUG:
+                        print(
+                            f"[KEEP_PHASE] tls_id={tls_id}, "
+                            f"phase={current_phase_id}, max_other_waiting={max_other_waiting}"
+                        )
+                    continue
+
+            # --- Вычисляем длительность зелёного для выбранной фазы --- #
+
+            waiting_count = self._calculate_waiting_traffic(observation, tls_id, best_phase_id)
+            capacity = self._estimate_phase_capacity(observation, tls_id, best_phase_id)
+
+            # Базовая идея: длительность растёт как sqrt(очереди), чтобы рост был плавным
+            # И немного учтём пропускную способность (но с маленьким коэффициентом)
+            sqrt_waiting = math.sqrt(max(0.0, waiting_count))
+            duration = self.min_green_duration + 3.5 * sqrt_waiting
+
+            # Маленький коэффициент на capacity, чтобы не взлетало
+            duration += 0.02 * (capacity / 10.0)
+
+            # Ограничиваем длительность
+            duration = max(self.min_green_duration, min(self.max_green_duration, duration))
+
+            # Если мы уже долго держим эту фазу — начинаем чуть-чуть резать время,
+            # чтобы не "залипать" и давать шанс другим фазам.
+            self.phase_timer[tls_id][best_phase_id] += 1
+            for pid in self.green_phases[tls_id]:
+                if pid != best_phase_id:
+                    self.phase_timer[tls_id][pid] = 0
+
+            if self.phase_timer[tls_id][best_phase_id] > 5:
+                duration *= 0.9  # легкое снижение длительности при долгом удержании
+                duration = max(self.min_green_duration, duration)
+
+            # Обновляем статистику по фазе
+            self.last_phase_actions[tls_id][best_phase_id] = (
+                self.last_phase_actions[tls_id].get(best_phase_id, 0.0) + 1.0
+            )
+            self.cursor[tls_id] = (
+                self.cursor[tls_id] + 1
+            ) % len(self.green_phases[tls_id])
+
+            action = {
+                "phase_id": int(best_phase_id),
+                "duration": float(f"{duration:.1f}"),
+            }
+            decision[tls_id] = action
+
+            if DEBUG:
+                print(
+                    f"[DECISION] tls_id={tls_id}, "
+                    f"best_phase_id={best_phase_id}, waiting={waiting_count}, "
+                    f"capacity={capacity:.1f}, duration={duration:.1f}"
+                )
+
+        return decision or None
